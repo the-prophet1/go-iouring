@@ -23,11 +23,20 @@ func ByteSliceToSqes(slice []byte) []IoUringSqe {
 	return res
 }
 
+func PtrToUint32Slice(ptr uintptr, len, cap int) []uint32 {
+	var res []uint32
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&res))
+	hdr.Data = ptr
+	hdr.Len = len
+	hdr.Cap = cap
+	return res
+}
+
 func PtrToCqes(ptr uintptr, len, cap int) []IoUringCqe {
 	var res []IoUringCqe
 	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&res))
 	hdr.Data = ptr
 	hdr.Len = len
-	hdr.Cap = len
+	hdr.Cap = cap
 	return res
 }

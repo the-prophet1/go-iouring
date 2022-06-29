@@ -52,6 +52,16 @@ const (
 )
 
 const (
+	IORING_SETUP_IOPOLL    = 1 << iota /* io_context is polled */
+	IORING_SETUP_SQPOLL    = 1 << iota /* SQ poll thread */
+	IORING_SETUP_SQ_AFF    = 1 << iota /* sq_thread_cpu is valid */
+	IORING_SETUP_CQSIZE    = 1 << iota /* app defines CQ size */
+	IORING_SETUP_CLAMP     = 1 << iota /* clamp SQ/CQ ring sizes */
+	IORING_SETUP_ATTACH_WQ = 1 << iota /* attach to existing wq */
+
+)
+
+const (
 	//IORING_FEATURE_SINGLE_MMAP use single mapping memory
 	//cq and sq shared a mapping memory
 	IORING_FEATURE_SINGLE_MMAP     = 1 << iota
@@ -115,7 +125,7 @@ type Sigset struct {
 }
 
 func IoUringSetup(entries int, params *IoUringParams) (fd int, err error) {
-	res, _, e := syscall.RawSyscall(_NR_IO_URING_SETUP,
+	res, _, e := syscall.Syscall(_NR_IO_URING_SETUP,
 		uintptr(entries), uintptr(unsafe.Pointer(params)),
 		0)
 	if e != 0 {
@@ -135,7 +145,7 @@ func IoUringEnter(fd int, toSubmit int, minComplete uint, flags uint, sig *Sigse
 }
 
 func IoUringRegister(fd int, opcode uint, arg uintptr, nrArgs uint) (err error) {
-	_, _, e := syscall.RawSyscall6(_NR_IO_URING_REGISTER, uintptr(fd), uintptr(opcode), arg, uintptr(nrArgs), 0, 0)
+	_, _, e := syscall.Syscall6(_NR_IO_URING_REGISTER, uintptr(fd), uintptr(opcode), arg, uintptr(nrArgs), 0, 0)
 	if e != 0 {
 		err = e
 	}
@@ -164,7 +174,7 @@ type IoUringSq struct {
 	KRingEntries *uint32
 	KFlags       *uint32
 	KDropped     *uint32
-	Array        *uint32
+	Array        []uint32
 	Sqes         []IoUringSqe
 	SqeHead      uint32
 	SqeTail      uint32
@@ -187,7 +197,7 @@ type IoUringCq struct {
 	KRingEntries *uint32
 	KFlags       *uint32
 	KOverflow    *uint32
-	Cqes         *IoUringCqe
+	Cqes         []IoUringCqe
 	RingSize     int
 	Ring         []byte
 }
@@ -195,10 +205,11 @@ type IoUringCq struct {
 type IoUring struct {
 	Sq     IoUringSq
 	Cq     IoUringCq
-	flags  uint
-	ringFd int
+	Flags  uint32
+	RingFd int
 }
 
+//set shared memory info to uring
 func (ring *IoUring) ioUringMmap(fd int, params *IoUringParams) error {
 	var (
 		size int
@@ -250,7 +261,10 @@ func (ring *IoUring) ioUringMmap(fd int, params *IoUringParams) error {
 	sq.KRingEntries = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.RingEntries)))
 	sq.KFlags = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Flags)))
 	sq.KDropped = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Dropped)))
-	sq.Array = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Array)))
+	sq.Array = PtrToUint32Slice(
+		SliceByteAddr(sq.Ring)+uintptr(params.SqOff.Array),
+		int(*sq.KRingEntries),
+		int(*sq.KRingEntries))
 
 	size = int(params.SqEntries) * int(unsafe.Sizeof(IoUringSqe{}))
 
@@ -272,7 +286,10 @@ func (ring *IoUring) ioUringMmap(fd int, params *IoUringParams) error {
 	cq.KRingMask = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.RingMask)))
 	cq.KRingEntries = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.RingEntries)))
 	cq.KOverflow = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Overflow)))
-	cq.Cqes = (*IoUringCqe)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Cqes)))
+	cq.Cqes = PtrToCqes(
+		SliceByteAddr(cq.Ring)+uintptr(params.CqOff.Cqes),
+		int(*cq.KRingEntries),
+		int(*cq.KRingEntries))
 	if params.CqOff.Flags != 0 {
 		cq.KFlags = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Flags)))
 	}
@@ -287,6 +304,10 @@ func ioUringUnmapRings(sq *IoUringSq, cq *IoUringCq) {
 	}
 }
 
+// NewIoUringQueue create an iouring queue.
+// entries set the number of elements in the ring,entries needs to be 2^n.
+// If entries is not 2^n, it will automatically grow to 2^n.
+// flags is used to set the flag bits of the kernel ring.
 func NewIoUringQueue(entries int, flags uint32) (*IoUring, error) {
 	var params IoUringParams
 	params.Flags = flags
@@ -306,6 +327,8 @@ func NewIoUringQueueParams(entries int, params *IoUringParams) (*IoUring, error)
 
 func IoUringQueueMmap(fd int, params *IoUringParams) (*IoUring, error) {
 	var ring IoUring
+	ring.RingFd = fd
+	ring.Flags = params.Flags
 
 	if err := ring.ioUringMmap(fd, params); err != nil {
 		return nil, err
