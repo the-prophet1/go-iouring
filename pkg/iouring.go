@@ -1,6 +1,9 @@
-package main
+package pkg
 
 import (
+	"errors"
+	"reflect"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -83,19 +86,6 @@ const (
 	IORING_OFFSET_SQES    = 0x10000000
 )
 
-type IoUringParams struct {
-	SqEntries    uint32
-	CqEntries    uint32
-	Flags        uint32
-	SqThreadCpu  uint32
-	SqThreadIdle uint32
-	Features     uint32
-	WqFd         uint32
-	Resv         [3]uint32
-	SqOff        IoSqringOffsets
-	CqOff        IoCqringOffsets
-}
-
 type IoSqringOffsets struct {
 	Head        uint32
 	Tail        uint32
@@ -120,38 +110,6 @@ type IoCqringOffsets struct {
 	Resv2       uint64
 }
 
-type Sigset struct {
-	Val [16]int64
-}
-
-func IoUringSetup(entries int, params *IoUringParams) (fd int, err error) {
-	res, _, e := syscall.Syscall(_NR_IO_URING_SETUP,
-		uintptr(entries), uintptr(unsafe.Pointer(params)),
-		0)
-	if e != 0 {
-		err = e
-	}
-	return int(res), err
-}
-
-func IoUringEnter(fd int, toSubmit int, minComplete uint, flags uint, sig *Sigset) (err error) {
-	_, _, e := syscall.Syscall6(_NR_IO_URING_ENTER,
-		uintptr(fd), uintptr(toSubmit), uintptr(minComplete), uintptr(flags), uintptr(unsafe.Pointer(sig)),
-		NSIG/8)
-	if e != 0 {
-		err = e
-	}
-	return err
-}
-
-func IoUringRegister(fd int, opcode uint, arg uintptr, nrArgs uint) (err error) {
-	_, _, e := syscall.Syscall6(_NR_IO_URING_REGISTER, uintptr(fd), uintptr(opcode), arg, uintptr(nrArgs), 0, 0)
-	if e != 0 {
-		err = e
-	}
-	return err
-}
-
 //IoUringSqe is iouring submission queue entry
 type IoUringSqe struct {
 	Opcode            uint8
@@ -164,6 +122,35 @@ type IoUringSqe struct {
 	FlagsOrEvents     Union3
 	UserData          uint64
 	UnionStruct
+}
+
+func (sqe *IoUringSqe) PrepReadv(fd int, iovecs []syscall.Iovec, offset uint64) {
+	sqe.prepRW(IORING_OP_READV, int32(fd), reflect.ValueOf(iovecs).Pointer(), uint32(len(iovecs)), offset)
+}
+
+func (sqe *IoUringSqe) SetUserData(data interface{}) {
+	dataPtr := unsafe.Pointer(&data)
+	sqe.UserData = uint64(uintptr(dataPtr))
+}
+
+func (sqe *IoUringSqe) GetUserData() interface{} {
+	dataPtr := unsafe.Pointer(uintptr(sqe.UserData))
+	return *(*interface{})(dataPtr)
+}
+
+func (sqe *IoUringSqe) prepRW(op uint8, fd int32, addr uintptr, length uint32, offset uint64) {
+	sqe.Opcode = op
+	sqe.Flags = 0
+	sqe.IoPrIo = 0
+	sqe.Fd = fd
+	sqe.OffOrAddr2.SetOffset(offset)
+	sqe.AddrOrSpliceOffIn.SetAddr(uint64(addr))
+	sqe.Len = length
+	sqe.FlagsOrEvents.SetRWFlag(0)
+	sqe.UserData = 0
+	sqe.pad[0] = 0
+	sqe.pad[1] = 0
+	sqe.pad[2] = 0
 }
 
 //IoUringSq is iouring submission queue
@@ -254,13 +241,12 @@ func (ring *IoUring) ioUringMmap(fd int, params *IoUringParams) error {
 			return err
 		}
 	}
-
-	sq.KHead = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Head)))
-	sq.KTail = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Tail)))
-	sq.KRingMask = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.RingMask)))
-	sq.KRingEntries = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.RingEntries)))
-	sq.KFlags = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Flags)))
-	sq.KDropped = (*uint32)(unsafe.Pointer(SliceByteAddr(sq.Ring) + uintptr(params.SqOff.Dropped)))
+	sq.KHead = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.Head))
+	sq.KTail = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.Tail))
+	sq.KRingMask = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.RingMask))
+	sq.KRingEntries = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.RingEntries))
+	sq.KFlags = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.Flags))
+	sq.KDropped = (*uint32)(unsafe.Add(SliceBytePoint(sq.Ring), params.SqOff.Dropped))
 	sq.Array = PtrToUint32Slice(
 		SliceByteAddr(sq.Ring)+uintptr(params.SqOff.Array),
 		int(*sq.KRingEntries),
@@ -281,20 +267,77 @@ func (ring *IoUring) ioUringMmap(fd int, params *IoUringParams) error {
 	}
 	sq.Sqes = ByteSliceToSqes(byteSqes)
 
-	cq.KHead = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Head)))
-	cq.KTail = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Tail)))
-	cq.KRingMask = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.RingMask)))
-	cq.KRingEntries = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.RingEntries)))
-	cq.KOverflow = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Overflow)))
-	cq.Cqes = PtrToCqes(
-		SliceByteAddr(cq.Ring)+uintptr(params.CqOff.Cqes),
-		int(*cq.KRingEntries),
-		int(*cq.KRingEntries))
+	cq.KHead = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.Head))
+	cq.KTail = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.Tail))
+	cq.KRingMask = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.RingMask))
+	cq.KRingEntries = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.RingEntries))
+	cq.KOverflow = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.Overflow))
+	cq.Cqes = PtrToCqes(SliceByteAddr(cq.Ring)+uintptr(params.CqOff.Cqes), int(*cq.KRingEntries), int(*cq.KRingEntries))
 	if params.CqOff.Flags != 0 {
-		cq.KFlags = (*uint32)(unsafe.Pointer(SliceByteAddr(cq.Ring) + uintptr(params.CqOff.Flags)))
+		cq.KFlags = (*uint32)(unsafe.Add(SliceBytePoint(cq.Ring), params.CqOff.Flags))
 	}
 
 	return nil
+}
+
+//GetSqe get a sqe from the sqe ring queue in iouring
+func (ring *IoUring) GetSqe() (*IoUringSqe, error) {
+	sq := &ring.Sq
+	head := atomic.LoadUint32(sq.KHead)
+
+	next := sq.SqeTail + 1
+	if next-head <= *sq.KRingEntries {
+		sqe := &sq.Sqes[sq.SqeTail&*sq.KRingMask]
+		sq.SqeTail = next
+		return sqe, nil
+	}
+	return nil, errors.New("sqe ring is full")
+}
+
+func (ring *IoUring) Submit() error {
+	return ring.submitAndWait(0)
+}
+
+func (ring *IoUring) submitAndWait(waitNumber int) error {
+	return ring.submit(waitNumber)
+}
+
+func (ring *IoUring) submit(waitNumber int) error {
+
+}
+
+func (ring *IoUring) flushSQ() uint32 {
+	var (
+		sq       = &ring.Sq
+		mask     = *sq.KRingMask
+		ktail    uint32
+		toSubmit uint32
+	)
+
+	if sq.SqeHead == sq.SqeTail {
+		ktail = *sq.KTail
+		return ktail - *sq.KHead
+	}
+
+	/*
+		Fill in sqes that we have queued up, adding them to the kernel ring
+			ktail = *sq->ktail;
+			to_submit = sq->sqe_tail - sq->sqe_head;
+			while (to_submit--) {
+				sq->array[ktail & mask] = sq->sqe_head & mask;
+				ktail++;
+				sq->sqe_head++;
+			}
+	*/
+	ktail = *sq.KTail
+	toSubmit = sq.SqeTail - sq.SqeHead
+	for ; toSubmit != 0; toSubmit-- {
+		sq.Array[ktail&mask] = sq.SqeHead & mask
+		ktail++
+		sq.SqeHead++
+	}
+	atomic.StoreUint32(sq.KTail, ktail)
+	return ktail - *sq.KHead
 }
 
 func ioUringUnmapRings(sq *IoUringSq, cq *IoUringCq) {
@@ -322,7 +365,6 @@ func NewIoUringQueueParams(entries int, params *IoUringParams) (*IoUring, error)
 	}
 
 	return IoUringQueueMmap(fd, params)
-
 }
 
 func IoUringQueueMmap(fd int, params *IoUringParams) (*IoUring, error) {

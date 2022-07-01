@@ -1,4 +1,4 @@
-package main
+package pkg
 
 import (
 	"reflect"
@@ -11,6 +11,10 @@ func SliceByteAddrEqual(slice1, slice2 []byte) bool {
 
 func SliceByteAddr(slice []byte) uintptr {
 	return reflect.ValueOf(slice).Pointer()
+}
+
+func SliceBytePoint(slice []byte) unsafe.Pointer {
+	return unsafe.Pointer(SliceByteAddr(slice))
 }
 
 func ByteSliceToSqes(slice []byte) []IoUringSqe {

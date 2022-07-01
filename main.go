@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
+	"unsafe"
 )
 
 func must(err error) {
@@ -12,12 +12,21 @@ func must(err error) {
 	}
 }
 
+var userdata uint64
+
 func main() {
-	var params IoUringParams
-	ring, err := NewIoUringQueueParams(4, &params)
-	must(err)
-	data, _ := json.Marshal(ring)
-	paramsData, _ := json.Marshal(params)
-	fmt.Println(string(data))
-	fmt.Println(string(paramsData))
+	s := "data"
+	SetData(s)
+	data := GetData()
+	fmt.Println(data)
+}
+
+func SetData(data interface{}) {
+	dataPtr := unsafe.Pointer(&data)
+	userdata = uint64(uintptr(dataPtr))
+}
+
+func GetData() interface{} {
+	dataPtr := unsafe.Pointer(uintptr(userdata))
+	return *(*interface{})(dataPtr)
 }

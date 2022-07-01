@@ -1,8 +1,8 @@
-package main
+package pkg
 
 type Union1 uint64
 
-func (u *Union1) SetOffset(offset uint) {
+func (u *Union1) SetOffset(offset uint64) {
 	*u = Union1(offset)
 }
 
@@ -10,7 +10,7 @@ func (u Union1) Offset() uint64 {
 	return uint64(u)
 }
 
-func (u *Union1) SetAddr2(addr2 uint) {
+func (u *Union1) SetAddr2(addr2 uint64) {
 	*u = Union1(addr2)
 }
 
@@ -20,7 +20,7 @@ func (u Union1) Addr2() uint64 {
 
 type Union2 uint64
 
-func (u *Union2) SetAddr(addr uint) {
+func (u *Union2) SetAddr(addr uint64) {
 	*u = Union2(addr)
 }
 
@@ -138,7 +138,7 @@ type UnionStruct struct {
 	Union4
 	Personality uint16
 	SpliceFdIn  int32
-	pad         [2]uint64
+	pad         [3]uint64
 }
 
 type Union4 uint16
